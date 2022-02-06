@@ -27,6 +27,7 @@ import { EventStatus, IContent, IDecryptOptions, IEvent, MatrixEvent } from "./m
 import { StubStore } from "./store/stub";
 import { createNewMatrixCall, MatrixCall } from "./webrtc/call";
 import { Filter, IFilterDefinition } from "./filter";
+import WebSocketApi from "./websocket";
 import { CallEventHandler } from './webrtc/callEventHandler';
 import * as utils from './utils';
 import { sleep } from './utils';
@@ -243,6 +244,13 @@ export interface ICreateClientOpts {
      * time to wait before timing out HTTP requests. If not specified, there is no timeout.
      */
     localTimeoutMs?: number;
+
+    /**
+     * Set to false to prefer SyncAPI (long
+     * polling) to WebSocketAPI. If not set WebSocketApi will be prefered.
+     * Note: There is a fallback to SyncAPI if WebSocketAPI does not work
+     */
+    useWebSockets?: boolean;
 
     /**
      * Set to true to use
@@ -769,6 +777,7 @@ export class MatrixClient extends EventEmitter {
     public pickleKey: string;
     public scheduler: MatrixScheduler;
     public clientRunning = false;
+    public useWebSockets = false;
     public timelineSupport = false;
     public urlPreviewCache: { [key: string]: Promise<IPreviewUrlResponse> } = {};
     public unstableClientRelationAggregation = false;
@@ -797,6 +806,7 @@ export class MatrixClient extends EventEmitter {
     protected fallbackICEServerAllowed = false;
     protected roomList: RoomList;
     protected syncApi: SyncApi;
+    protected websocketApi: WebSocketApi;
     public pushRules: IPushRules;
     protected syncLeftRoomsPromise: Promise<Room[]>;
     protected syncedLeftRooms = false;
@@ -878,6 +888,7 @@ export class MatrixClient extends EventEmitter {
 
         this.scheduler = opts.scheduler;
         if (this.scheduler) {
+            // will be set to use WebSockets by WebSocketApi if needed
             this.scheduler.setProcessFunction(async (eventToSend: MatrixEvent) => {
                 const room = this.getRoom(eventToSend.getRoomId());
                 if (eventToSend.status !== EventStatus.SENDING) {
@@ -905,6 +916,7 @@ export class MatrixClient extends EventEmitter {
             this.on("sync", this.startCallEventHandler);
         }
 
+        this.useWebSockets = Boolean(opts.useWebSockets);
         this.timelineSupport = Boolean(opts.timelineSupport);
         this.unstableClientRelationAggregation = !!opts.unstableClientRelationAggregation;
 
@@ -1048,6 +1060,11 @@ export class MatrixClient extends EventEmitter {
             logger.error("Still have sync object whilst not running: stopping old one");
             this.syncApi.stop();
         }
+        if (this.websocketApi) {
+            logger.error("Still have websocket object whilst not running: stopping old one");
+            this.websocketApi.stop();
+            this.websocketApi = null;
+        }
 
         await this.getCapabilities(true);
 
@@ -1060,8 +1077,24 @@ export class MatrixClient extends EventEmitter {
             }
             return this.canResetTimelineCallback(roomId);
         };
+
+        // WebsocketAPI uses some of SyncApi-functions - so need to be created before
+        // TODO check if methods can be made static or moved to another class
         this.syncApi = new SyncApi(this, this.clientOpts);
-        this.syncApi.sync();
+        if (this.useWebSockets) {
+            this.websocketApi = new WebSocketApi(this, opts);
+            this.websocketApi.start();
+
+            this.scheduler.setProcessFunction((eventToSend) => {
+                const room = this.getRoom(eventToSend.getRoomId());
+                if (eventToSend.status !== EventStatus.SENDING) {
+                    this.updatePendingEventStatus(room, eventToSend, EventStatus.SENDING);
+                }
+                return this.websocketApi.sendEvent(eventToSend);
+            });
+        } else {
+            this.syncApi.sync();
+        }
 
         if (this.clientOpts.clientWellKnownPollPeriod !== undefined) {
             this.clientWellKnownIntervalID = setInterval(() => {
@@ -1083,6 +1116,9 @@ export class MatrixClient extends EventEmitter {
         this.syncApi?.stop();
         this.syncApi = null;
 
+        this.websocketApi?.stop();
+        this.websocketApi = null;
+
         this.crypto?.stop();
         this.peekSync?.stopPeeking();
 
@@ -1093,6 +1129,33 @@ export class MatrixClient extends EventEmitter {
         if (this.clientWellKnownIntervalID !== undefined) {
             global.clearInterval(this.clientWellKnownIntervalID);
         }
+    }
+
+    /**
+     * Called by WebSocketApi to fallback to Longpolling (SyncAPI)
+     * @param {Object} opts The same Object as defined for SyncApi or WebSocketApi (to init)
+     * @param {Object} syncOptions Parameter to start syncApi._sync() with to
+     *     not beeing forced to run initialization of the client again
+     * TODO: Find a not so hacky way to implement this
+     */
+    connectionFallback(opts, syncOptions) {
+        this.useWebSockets = false;
+        logger.log("Do Fallback to SyncAPI");
+        if (! this.syncApi) {
+            this.syncApi = new SyncApi(this, opts);
+        }
+
+        this.syncApi.sync();
+        this.websocketApi.stop();
+        this.websocketApi = null;
+
+        this.scheduler.setProcessFunction((eventToSend) => {
+            const room = this.getRoom(eventToSend.getRoomId());
+            if (eventToSend.status !== EventStatus.SENDING) {
+                this.updatePendingEventStatus(room, eventToSend, EventStatus.SENDING);
+            }
+            return this.sendEventHttpRequest(eventToSend);
+        });
     }
 
     /**
@@ -1369,6 +1432,9 @@ export class MatrixClient extends EventEmitter {
      * @see module:client~MatrixClient#event:"sync"
      */
     public getSyncState(): SyncState {
+        if (this.useWebSockets && this.websocketApi) {
+            return this.websocketApi.getSyncState();
+        }
         if (!this.syncApi) {
             return null;
         }
@@ -1437,6 +1503,9 @@ export class MatrixClient extends EventEmitter {
      * @return {boolean} True if this resulted in a request being retried.
      */
     public retryImmediately(): boolean {
+        if (this.websocketApi) {
+            return this.websocketApi.reconnectNow();
+        }
         return this.syncApi.retryImmediately();
     }
 
@@ -3731,6 +3800,9 @@ export class MatrixClient extends EventEmitter {
             }
 
             if (!promise) {
+                if (this.useWebSockets && this.websocketApi) {
+                    promise = this.websocketApi.sendEvent(event);
+                }
                 promise = this.sendEventHttpRequest(event);
                 if (room) {
                     promise = promise.then(res => {
@@ -4391,6 +4463,7 @@ export class MatrixClient extends EventEmitter {
      * @param {module:client.callback} callback Optional.
      * @return {Promise} Resolves: to an empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * TODO: Propose/Implement usage of WebSocketApi
      */
     public async sendReadReceipt(event: MatrixEvent, opts?: { hidden?: boolean }, callback?: Callback): Promise<{}> {
         if (typeof (opts) === 'function') {
@@ -4450,6 +4523,9 @@ export class MatrixClient extends EventEmitter {
             }
         }
 
+        if (this.useWebSockets && this.websocketApi) {
+            return this.websocketApi.sendReadMarkers(roomId, rmEventId, rrEventId);
+        }
         return this.setRoomReadMarkersHttpRequest(roomId, rmEventId, rrEventId, opts);
     }
 
@@ -4514,6 +4590,9 @@ export class MatrixClient extends EventEmitter {
             return Promise.resolve({}); // guests cannot send typing notifications so don't bother.
         }
 
+        if (this.useWebSockets && this.websocketApi) {
+            return this.websocketApi.sendTyping(roomId, isTyping, timeoutMs, callback);
+        }
         const path = utils.encodeUri("/rooms/$roomId/typing/$userId", {
             $roomId: roomId,
             $userId: this.credentials.userId,
@@ -4999,6 +5078,9 @@ export class MatrixClient extends EventEmitter {
         if (validStates.indexOf(opts.presence) === -1) {
             throw new Error("Bad presence value: " + opts.presence);
         }
+        if (this.useWebSockets && this.websocketApi) {
+            return this.websocketApi.sendPresence(opts);
+        }
         return this.http.authedRequest(
             callback, Method.Put, path, undefined, opts,
         );
@@ -5421,6 +5503,7 @@ export class MatrixClient extends EventEmitter {
      * @param {String} roomId The room to attempt to peek into.
      * @return {Promise} Resolves: Room object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * TODO: Propose/Implement usage of WebSocketApi (maybe separate for requesting /events)
      */
     public peekInRoom(roomId: string): Promise<Room> {
         if (this.peekSync) {
@@ -5720,6 +5803,7 @@ export class MatrixClient extends EventEmitter {
             }
         } else {
             throw new Error(
+                // TODO or WebSocket has to be initialized
                 "SyncApi.sync() must be done before accessing to push rules.",
             );
         }
